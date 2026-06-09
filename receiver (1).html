@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>Vanish Receiver</title>
+<style>
+  :root{
+    --panel:#0e1620; --panel-edge:#1d2c3a; --ink:#cfe0ec; --muted:#7d92a3;
+    --teal:#2fd4c4; --teal-dim:#15706a; --field:#0a1118; --warn:#ffb454;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;color:var(--ink);
+    font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;-webkit-tap-highlight-color:transparent}
+  /* output canvas fills the screen; the camera + processing live behind it */
+  #out{position:fixed;inset:0;width:100%;height:100%;object-fit:cover;background:#000;z-index:0}
+  video{display:none}
+
+  /* start gate: camera needs a tap to begin (and a secure HTTPS origin) */
+  #gate{position:fixed;inset:0;z-index:30;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;gap:22px;padding:32px;text-align:center;
+    background:radial-gradient(120% 90% at 50% 10%,#13212e,#060b11)}
+  #gate h1{margin:0;font-size:13px;letter-spacing:.22em;text-transform:uppercase;color:var(--teal)}
+  #gate p{margin:0;max-width:300px;font-size:12px;line-height:1.6;color:var(--muted)}
+  #start{padding:16px 40px;font:inherit;font-size:13px;letter-spacing:.14em;text-transform:uppercase;
+    color:#04201d;background:var(--teal);border:none;border-radius:11px;font-weight:600;cursor:pointer}
+  #err{display:none;color:var(--warn);font-size:11.5px;max-width:300px;line-height:1.6}
+
+  /* control strip along the bottom, thumb-reachable */
+  #hud{position:fixed;z-index:20;left:12px;right:12px;bottom:12px;
+    background:rgba(14,22,32,.9);border:1px solid var(--panel-edge);border-radius:14px;
+    backdrop-filter:blur(8px);padding:12px 14px;display:none}
+  .stat{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+  .stat .lbl{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--teal)}
+  .stat .fps{font-size:10px;color:var(--muted)}
+  .row{margin:0 0 10px}
+  .row:last-child{margin-bottom:0}
+  label{display:block;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
+  .val{float:right;color:var(--ink);letter-spacing:0}
+  input[type=range]{width:100%;-webkit-appearance:none;height:3px;border-radius:3px;
+    background:linear-gradient(90deg,var(--teal-dim),var(--teal));outline:none}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;height:20px;border-radius:50%;
+    background:var(--ink);border:2px solid var(--teal)}
+  input[type=range]::-moz-range-thumb{width:20px;height:20px;border-radius:50%;background:var(--ink);border:2px solid var(--teal)}
+  .toggles{display:flex;gap:6px}
+  .toggles button{flex:1;padding:9px 4px;font:inherit;font-size:10px;letter-spacing:.04em;
+    color:var(--muted);background:var(--field);border:1px solid var(--panel-edge);border-radius:8px;cursor:pointer}
+  .toggles button.on{color:#04201d;background:var(--teal);border-color:var(--teal);font-weight:600}
+</style>
+</head>
+<body>
+<video id="vid" playsinline muted autoplay></video>
+<canvas id="out"></canvas>
+
+<div id="gate">
+  <h1>Vanish Receiver</h1>
+  <p>Point the rear camera at the flashing monitor. The screen region gets detected and painted over with the surroundings.</p>
+  <button id="start">Start camera</button>
+  <div id="err"></div>
+</div>
+
+<div id="hud">
+  <div class="stat"><span class="lbl">Live</span><span class="fps" id="fps">– fps</span></div>
+  <div class="row">
+    <label>Detection threshold <span class="val" id="thVal">22</span></label>
+    <input id="th" type="range" min="6" max="60" step="1" value="22">
+  </div>
+  <div class="row">
+    <label>Region grow <span class="val" id="grVal">2</span></label>
+    <input id="gr" type="range" min="0" max="6" step="1" value="2">
+  </div>
+  <div class="row">
+    <label>View</label>
+    <div class="toggles">
+      <button data-view="fill" class="on">Erased</button>
+      <button data-view="mask">Mask</button>
+      <button data-view="raw">Raw</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const vid = document.getElementById('vid');
+const out = document.getElementById('out');
+const octx = out.getContext('2d', { willReadFrequently:true });
+
+// offscreen processing buffer (kept small for real-time JS)
+const PW = 480;                 // processing width; height derived from camera aspect
+let PH = 360;
+const work = document.createElement('canvas');
+const wctx = work.getContext('2d', { willReadFrequently:true });
+
+let prevGray = null;            // last frame luminance
+let activity = null;            // exponential moving average of |frame diff|
+let mask = null;                // Uint8 region mask
+let blurBuf = null;
+
+let TH = 22;                    // activity threshold
+let GROW = 2;                   // dilation radius for the mask
+let view = 'fill';
+let running = false;
+
+const DECAY = 0.72;             // higher = activity persists longer (steadier mask)
+
+function setupBuffers(w,h){
+  PH = Math.round(PW * h / w);
+  work.width = PW; work.height = PH;
+  out.width = PW; out.height = PH;
+  const n = PW*PH;
+  prevGray = new Float32Array(n);
+  activity = new Float32Array(n);
+  mask = new Uint8Array(n);
+  blurBuf = new Float32Array(n);
+}
+
+async function start(){
+  const errEl = document.getElementById('err');
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    errEl.style.display='block';
+    errEl.textContent = 'Camera API unavailable. Open this page over HTTPS (camera is blocked on plain http on phones).';
+    return;
+  }
+  try{
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal:'environment' }, width:{ideal:1280}, height:{ideal:720} },
+      audio: false
+    });
+    vid.srcObject = stream;
+    await vid.play();
+    setupBuffers(vid.videoWidth || 1280, vid.videoHeight || 720);
+    document.getElementById('gate').style.display='none';
+    document.getElementById('hud').style.display='block';
+    running = true;
+    requestAnimationFrame(loop);
+  }catch(e){
+    errEl.style.display='block';
+    errEl.textContent = 'Could not start camera: ' + e.name +
+      '. On iPhone/Android the page must be served over HTTPS, and camera permission must be allowed.';
+  }
+}
+document.getElementById('start').onclick = start;
+
+// 3x3 box blur of a float field (smooths noise, fills small holes before thresholding)
+function boxBlur(src, dst, w, h){
+  for(let y=0;y<h;y++){
+    const y0=(y>0?y-1:0)*w, y1=y*w, y2=(y<h-1?y+1:h-1)*w;
+    for(let x=0;x<w;x++){
+      const x0=x>0?x-1:0, x2=x<w-1?x+1:w-1;
+      dst[y1+x] = (src[y0+x0]+src[y0+x]+src[y0+x2]
+                  +src[y1+x0]+src[y1+x]+src[y1+x2]
+                  +src[y2+x0]+src[y2+x]+src[y2+x2]) * 0.111111;
+    }
+  }
+}
+
+let frames=0, fpsT=performance.now();
+
+function loop(){
+  if(!running) return;
+  const w=PW, h=PH;
+
+  wctx.drawImage(vid, 0,0, w,h);
+  const img = wctx.getImageData(0,0,w,h);
+  const d = img.data;
+
+  // luminance + temporal activity
+  for(let i=0,p=0;i<w*h;i++,p+=4){
+    const g = d[p]*0.299 + d[p+1]*0.587 + d[p+2]*0.114;
+    const diff = Math.abs(g - prevGray[i]);
+    activity[i] = activity[i]*DECAY + diff*(1-DECAY);
+    prevGray[i] = g;
+  }
+
+  // smooth the activity field, then threshold into a mask
+  boxBlur(activity, blurBuf, w, h);
+  for(let i=0;i<w*h;i++) mask[i] = blurBuf[i] > TH ? 1 : 0;
+
+  // grow the mask so flat interior cells (briefly matching between flips) get covered
+  if(GROW>0) dilate(mask, w, h, GROW);
+
+  if(view==='raw'){
+    octx.putImageData(img,0,0);
+  } else if(view==='mask'){
+    for(let i=0,p=0;i<w*h;i++,p+=4){
+      if(mask[i]){ d[p]=255; d[p+1]=40; d[p+2]=80; }
+      else { const v=prevGray[i]*0.5; d[p]=v; d[p+1]=v; d[p+2]=v; }
+    }
+    octx.putImageData(img,0,0);
+  } else {
+    inpaintRows(d, mask, w, h);   // erase: fill masked runs from left/right neighbours
+    octx.putImageData(img,0,0);
+  }
+
+  frames++;
+  const now=performance.now();
+  if(now-fpsT>=500){
+    document.getElementById('fps').textContent = Math.round(frames*1000/(now-fpsT))+' fps';
+    frames=0; fpsT=now;
+  }
+  requestAnimationFrame(loop);
+}
+
+// binary dilation by `r` using separable horizontal+vertical max passes
+function dilate(m, w, h, r){
+  const tmp = new Uint8Array(w*h);
+  for(let y=0;y<h;y++){
+    const row=y*w;
+    for(let x=0;x<w;x++){
+      let on=0;
+      for(let k=-r;k<=r;k++){ const xx=x+k; if(xx>=0&&xx<w&&m[row+xx]){on=1;break;} }
+      tmp[row+x]=on;
+    }
+  }
+  for(let x=0;x<w;x++){
+    for(let y=0;y<h;y++){
+      let on=0;
+      for(let k=-r;k<=r;k++){ const yy=y+k; if(yy>=0&&yy<h&&tmp[yy*w+x]){on=1;break;} }
+      m[y*w+x]=on;
+    }
+  }
+}
+
+// per-row inpaint: each masked run is filled by blending its left and right edge pixels.
+// this is the "show the pixels to the left or right of the screen" effect.
+function inpaintRows(d, m, w, h){
+  for(let y=0;y<h;y++){
+    const row=y*w;
+    let x=0;
+    while(x<w){
+      if(!m[row+x]){ x++; continue; }
+      let s=x;
+      while(x<w && m[row+x]) x++;
+      let e=x-1;
+      const lx=s-1, rx=e+1;
+      const lOK=lx>=0, rOK=rx<w;
+      const lp=(row+lx)*4, rp=(row+rx)*4;
+      const len=e-s+1;
+      if(lOK && rOK){
+        for(let k=0;k<len;k++){
+          const t=(k+1)/(len+1), p=(row+s+k)*4;
+          d[p]   = d[lp]  *(1-t) + d[rp]  *t;
+          d[p+1] = d[lp+1]*(1-t) + d[rp+1]*t;
+          d[p+2] = d[lp+2]*(1-t) + d[rp+2]*t;
+        }
+      } else if(lOK){
+        for(let k=0;k<len;k++){ const p=(row+s+k)*4; d[p]=d[lp]; d[p+1]=d[lp+1]; d[p+2]=d[lp+2]; }
+      } else if(rOK){
+        for(let k=0;k<len;k++){ const p=(row+s+k)*4; d[p]=d[rp]; d[p+1]=d[rp+1]; d[p+2]=d[rp+2]; }
+      }
+    }
+  }
+}
+
+// controls
+document.getElementById('th').oninput = e=>{ TH=+e.target.value; document.getElementById('thVal').textContent=TH; };
+document.getElementById('gr').oninput = e=>{ GROW=+e.target.value; document.getElementById('grVal').textContent=GROW; };
+document.querySelectorAll('.toggles button').forEach(b=>{
+  b.onclick=()=>{ document.querySelectorAll('.toggles button').forEach(x=>x.classList.remove('on'));
+    b.classList.add('on'); view=b.dataset.view; };
+});
+</script>
+</body>
+</html>

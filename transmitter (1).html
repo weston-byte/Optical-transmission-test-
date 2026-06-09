@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Beacon Transmitter</title>
+<style>
+  :root{
+    --panel:#0e1620; --panel-edge:#1d2c3a; --ink:#cfe0ec; --muted:#6f8597;
+    --teal:#2fd4c4; --teal-dim:#15706a; --field:#0a1118;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;
+    font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;color:var(--ink)}
+  /* the flashing field is the whole point: it fills everything behind the panel */
+  #field{position:fixed;inset:0;z-index:0}
+  /* control panel: a quiet instrument, tucked top-left, collapses on tap */
+  #panel{position:fixed;z-index:10;top:16px;left:16px;width:300px;max-width:calc(100vw - 32px);
+    background:rgba(14,22,32,.92);border:1px solid var(--panel-edge);border-radius:12px;
+    backdrop-filter:blur(8px);box-shadow:0 10px 40px rgba(0,0,0,.6);
+    transition:transform .2s ease,opacity .2s ease}
+  #panel.hidden{transform:translateY(-12px);opacity:0;pointer-events:none}
+  .head{display:flex;align-items:center;justify-content:space-between;
+    padding:12px 14px;border-bottom:1px solid var(--panel-edge)}
+  .title{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--teal)}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--teal);
+    box-shadow:0 0 10px var(--teal);animation:pulse 1s steps(2) infinite}
+  @keyframes pulse{50%{opacity:.25}}
+  .body{padding:14px}
+  .row{margin:0 0 14px}
+  label{display:block;font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;
+    color:var(--muted);margin-bottom:7px}
+  .val{color:var(--ink);float:right;letter-spacing:0}
+  input[type=range]{width:100%;-webkit-appearance:none;height:3px;border-radius:3px;
+    background:linear-gradient(90deg,var(--teal-dim),var(--teal));outline:none}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;
+    border-radius:50%;background:var(--ink);border:2px solid var(--teal);cursor:pointer}
+  input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;
+    background:var(--ink);border:2px solid var(--teal);cursor:pointer}
+  .modes{display:flex;gap:6px}
+  .modes button{flex:1;padding:8px 4px;font:inherit;font-size:10.5px;letter-spacing:.04em;
+    color:var(--muted);background:var(--field);border:1px solid var(--panel-edge);
+    border-radius:7px;cursor:pointer}
+  .modes button.on{color:#04201d;background:var(--teal);border-color:var(--teal);font-weight:600}
+  .go{width:100%;padding:11px;font:inherit;font-size:12px;letter-spacing:.1em;
+    text-transform:uppercase;color:#04201d;background:var(--teal);border:none;
+    border-radius:8px;cursor:pointer;font-weight:600}
+  .hint{font-size:10.5px;color:var(--muted);line-height:1.5;margin-top:12px}
+  .tab{position:fixed;z-index:10;top:16px;left:16px;width:36px;height:36px;border-radius:9px;
+    background:rgba(14,22,32,.92);border:1px solid var(--panel-edge);color:var(--teal);
+    display:none;align-items:center;justify-content:center;cursor:pointer;font-size:16px}
+</style>
+</head>
+<body>
+<canvas id="field"></canvas>
+
+<button id="tab" class="tab" aria-label="Show controls">≡</button>
+
+<div id="panel">
+  <div class="head">
+    <span class="title">Beacon</span>
+    <span style="display:flex;align-items:center;gap:10px">
+      <span class="dot" id="dot"></span>
+      <span style="cursor:pointer;color:var(--muted)" id="collapse" aria-label="Hide">–</span>
+    </span>
+  </div>
+  <div class="body">
+    <div class="row">
+      <label>Flip rate <span class="val" id="rateVal">5.0 Hz</span></label>
+      <input id="rate" type="range" min="1" max="15" step="0.5" value="5">
+    </div>
+    <div class="row">
+      <label>Cell size <span class="val" id="cellVal">52 px</span></label>
+      <input id="cell" type="range" min="16" max="120" step="4" value="52">
+    </div>
+    <div class="row">
+      <label>Pattern</label>
+      <div class="modes">
+        <button data-mode="checker" class="on">Checker</button>
+        <button data-mode="bw">Black/White</button>
+        <button data-mode="rgb">RGB</button>
+      </div>
+    </div>
+    <div class="row" style="margin-bottom:0">
+      <button class="go" id="full">Go full screen</button>
+      <div class="hint">Checker keeps average brightness steady so the phone's
+        auto-exposure won't fight the flash. Tap the field to hide these controls.
+        Leave wall or desk visible beside the monitor so the phone has pixels to fill in with.</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const cv = document.getElementById('field');
+const ctx = cv.getContext('2d');
+const panel = document.getElementById('panel');
+const tab = document.getElementById('tab');
+
+let DPR = Math.max(1, Math.min(window.devicePixelRatio||1, 2));
+function resize(){
+  DPR = Math.max(1, Math.min(window.devicePixelRatio||1, 2));
+  cv.width = Math.round(innerWidth*DPR);
+  cv.height = Math.round(innerHeight*DPR);
+  cv.style.width = innerWidth+'px';
+  cv.style.height = innerHeight+'px';
+}
+addEventListener('resize', resize); resize();
+
+let mode = 'checker';
+let rate = 5;          // flips per second
+let cell = 52;         // px (css)
+let phase = 0;         // toggles 0/1
+let rgbIdx = 0;
+const RGB = [[255,40,40],[40,255,80],[60,120,255]];
+
+function draw(){
+  const w = cv.width, h = cv.height, c = Math.max(4, cell*DPR);
+  if(mode === 'bw'){
+    ctx.fillStyle = phase ? '#fff' : '#000';
+    ctx.fillRect(0,0,w,h);
+  } else if(mode === 'rgb'){
+    const col = RGB[rgbIdx % 3];
+    ctx.fillStyle = `rgb(${col[0]},${col[1]},${col[2]})`;
+    ctx.fillRect(0,0,w,h);
+  } else { // checker, inverted each phase
+    const cols = Math.ceil(w/c), rows = Math.ceil(h/c);
+    for(let r=0;r<rows;r++){
+      for(let cI=0;cI<cols;cI++){
+        const on = ((r + cI) & 1) ^ phase;
+        ctx.fillStyle = on ? '#fff' : '#000';
+        ctx.fillRect(cI*c, r*c, c, c);
+      }
+    }
+  }
+}
+
+let last = 0;
+function loop(t){
+  const interval = 1000/rate;
+  if(t - last >= interval){
+    last = t;
+    phase ^= 1;
+    rgbIdx++;
+    draw();
+  }
+  requestAnimationFrame(loop);
+}
+draw();
+requestAnimationFrame(loop);
+
+// controls
+const rateEl = document.getElementById('rate');
+const cellEl = document.getElementById('cell');
+rateEl.oninput = e => { rate = +e.target.value; document.getElementById('rateVal').textContent = rate.toFixed(1)+' Hz'; };
+cellEl.oninput = e => { cell = +e.target.value; document.getElementById('cellVal').textContent = cell+' px'; draw(); };
+document.querySelectorAll('.modes button').forEach(b=>{
+  b.onclick = ()=>{
+    document.querySelectorAll('.modes button').forEach(x=>x.classList.remove('on'));
+    b.classList.add('on'); mode = b.dataset.mode; draw();
+  };
+});
+document.getElementById('full').onclick = ()=>{
+  const el = document.documentElement;
+  (el.requestFullscreen||el.webkitRequestFullscreen||(()=>{})).call(el);
+};
+function hide(){ panel.classList.add('hidden'); tab.style.display='flex'; }
+function show(){ panel.classList.remove('hidden'); tab.style.display='none'; }
+document.getElementById('collapse').onclick = hide;
+tab.onclick = show;
+cv.onclick = ()=> panel.classList.contains('hidden') ? show() : hide();
+</script>
+</body>
+</html>
